@@ -320,77 +320,490 @@ automation:
             title: Power restored
             message: Bazénové čerpadlo a plotna zapnuty
     mode: single
-  - id: '1677400876279'
-    alias: "EMS - Handle Battery charging mode (EV/meteoalarm) \U0001F697 \U0001F50B"
-    description: 'Prevent charging EV from battery at night or in the FAST mode.
+- id: '1676462307275'
+  alias: "EMS - Control EV Charging \U0001F697"
+  description: 'Control charging in 3 charging modes (FAST/SCHEDULED/AVAILABLE)
 
-      Decrease maximum battery discharge to 50% when power outage is expected.
+    Automatically set the more based on the car location and day of the week.
 
-      Set back to 90% when back in normal.'
-    trigger:
-    - platform: state
-      entity_id:
-      - binary_sensor.meteoalarm
-      id: scheduled_outage
-    - platform: state
-      entity_id:
-      - input_boolean.scheduled_power_outage
-      id: scheduled_outage
-    - platform: state
-      entity_id:
-      - switch.citigo_charging
-      id: citigo_charging
-    condition:
-    - condition: state
-      entity_id: input_boolean.energy_management
-      state: 'on'
-    action:
-    - variables:
-        mode: "{%- set severe_weather = iif(state_attr('binary_sensor.meteoalarm','awareness_type')
-          | is_defined, state_attr('binary_sensor.meteoalarm','awareness_type').split(';')[0]
-          | int,'') %} {%- set wind_thunderstorm = is_state('binary_sensor.meteoalarm','on')
-          and severe_weather in [1,3] %} {%- set fast = is_state('input_select.ev_citigo_charging','Fast')
-          and (states('sensor.average_pv_power') | float(0.0) < 4) %}  {%- set scheduled
-          = is_state('input_select.ev_citigo_charging','Scheduled') and is_state('sun.sun','below_horizon')
-          %}  {%- if wind_thunderstorm or is_state('input_boolean.scheduled_power_outage','on')
-          %}\n  eco_charge\n{%- elif is_state('switch.citigo_charging','on') and is_state('device_tracker.citigo_position','home')
-          and (fast or scheduled) %}\n  backup\n{%- else %}\n  general\n{%- endif %}"
-    - service: select.select_option
-      data:
-        option: '{{ mode }}'
-      target:
-        entity_id: select.inverter_operation_mode
-      alias: Set the invertor mode
-    - if:
+    Control maximum charging current based on sun power output.'
+  trigger:
+  - platform: time_pattern
+    minutes: /5
+    id: time
+  - platform: state
+    entity_id:
+    - input_select.ev_citigo_charging
+    id: citigo_fast
+    to: Fast
+  - platform: state
+    entity_id:
+    - input_select.ev_citigo_charging
+    id: citigo_available
+    to: Available
+  - platform: state
+    entity_id:
+    - input_select.ev_citigo_charging
+    id: citigo_scheduled
+    to: Scheduled
+  - platform: state
+    entity_id:
+    - input_select.ev_citigo_charging
+    id: citigo_off
+    to: 'Off'
+  - platform: state
+    entity_id:
+    - device_tracker.citigo_position
+    from: home
+    for:
+      hours: 0
+      minutes: 1
+      seconds: 0
+    id: citigo_left_home
+  - platform: zone
+    entity_id: device_tracker.citigo_position
+    zone: zone.home
+    event: enter
+    id: citigo_entered_home
+  - platform: state
+    entity_id:
+    - cover.right_garage_door
+    to: open
+    id: garaz_prava
+  - platform: state
+    entity_id:
+    - sun.sun
+    from: above_horizon
+    to: below_horizon
+    id: sunset
+  - platform: state
+    entity_id:
+    - input_number.ems_next_day_energy_treshold
+    - input_number.ev_citigo_charge_bad_day
+    - input_number.ev_citigo_charge_good_day
+    - input_number.ev_citigo_minimal_charge
+    id: parameter_change
+  condition:
+  - condition: state
+    entity_id: input_boolean.energy_management
+    state: 'on'
+  action:
+  - variables:
+      current: '{%- set pv = states(''sensor.average_pv_power'') | float(0.0) / 2.2
+        %} {%- set house = states(''sensor.average_house_consumption'') | float(0.0)
+        * 0.5 %} {%- set citigo = states(''sensor.citigo_power'') | float(0.0) %}
+        {%- set diff = pv - house + citigo %} {{ min(11, max(0, (diff / 230) | round
+        -0 )) }}'
+  - service: logbook.log
+    data:
+      name: EV Current calculation
+      entity_id: switch.citigo_zasuvka
+      message: 'PV Power: {{ states(''sensor.pv_power'') | float(0.0) }} House Consumption:
+        {{ states(''sensor.house_consumption'') | float(0.0) }} Citigo Power: {{ states(''sensor.citigo_power'')
+        | float(0.0) }} Calculated current: {{ current }}
+
+        '
+    enabled: false
+  - choose:
+    - conditions:
       - condition: trigger
-        id: scheduled_outage
+        id: citigo_off
+      sequence:
+      - service: switch.turn_off
+        data: {}
+        target:
+          entity_id: switch.citigo_zasuvka
+    - conditions:
+      - condition: trigger
+        id: citigo_left_home
+      sequence:
+      - service: input_select.select_option
+        data:
+          option: Fast
+        target:
+          entity_id: input_select.ev_citigo_charging
+      - service: switch.turn_off
+        data: {}
+        target:
+          entity_id: switch.citigo_zasuvka
+    - conditions:
+      - condition: or
+        conditions:
+        - condition: trigger
+          id: citigo_entered_home
+        - condition: and
+          conditions:
+          - condition: trigger
+            id: garaz_prava
+          - condition: template
+            value_template: '{{ states(''device_tracker.citigo_position'') != ''home''
+              }}'
+          alias: Garage open and not home
+        alias: Citigo entered Home
+      sequence:
+      - service: switch.turn_on
+        data: {}
+        target:
+          entity_id: switch.citigo_force_data_refresh
+      - service: input_select.select_option
+        data:
+          option: '{{ iif( now().isoweekday() in [5,6], ''Available'',''Scheduled'')
+            }}'
+        target:
+          entity_id: input_select.ev_citigo_charging
+    - conditions:
+      - condition: trigger
+        id: citigo_fast
+      sequence:
+      - service: script.ev_set_charger_max_current
+        data:
+          device_id: a3dda8d90539f021815031c3b4912670
+          current:
+            entity_id: sensor.citigo_charger_max_ampere
+          new: 32
+          switch:
+            entity_id: switch.citigo_zasuvka
+    - conditions:
+      - condition: or
+        conditions:
+        - condition: trigger
+          id: sunset
+        - condition: trigger
+          id: parameter_change
+      sequence:
+      - variables:
+          bad_day: '{{ states(''sensor.energy_production_tomorrow_front'') | int <
+            states(''input_number.ems_next_day_energy_treshold'') | int }}'
+      - service: input_number.set_value
+        data:
+          value: '{{ iif(bad_day,states(''input_number.ev_citigo_charge_bad_day''),
+            states(''input_number.ev_citigo_charge_good_day'')) }}'
+        target:
+          entity_id: input_number.ev_citigo_minimal_charge
+      - condition: not
+        conditions:
+        - condition: state
+          entity_id: input_select.ev_citigo_charging
+          state: Fast
+        alias: Charging is not Fast
+      - condition: template
+        value_template: '{{ now().isoweekday() in [5,7] }}'
+        alias: Change mode on Friday and Sunday
+      - service: input_select.select_option
+        data:
+          option: '{{ iif( now().isoweekday() in [5,6], ''Available'',''Scheduled'')
+            }}'
+        target:
+          entity_id: input_select.ev_citigo_charging
+  - if:
+    - condition: template
+      value_template: '{{ states(''input_select.ev_citigo_charging'') in [''Available'',''Scheduled'']
+        }}'
+      alias: Available or Scheduled
+    - condition: state
+      entity_id: sun.sun
+      state: above_horizon
+    - condition: zone
+      entity_id: device_tracker.citigo_position
+      zone: zone.home
+    - condition: state
+      entity_id: binary_sensor.citigo_charging_cable_connected
+      state: 'on'
+    then:
+    - if:
+      - condition: template
+        value_template: '{{ (current > 2) and (states(''sensor.citigo_battery_level'')
+          | int(0) < 100) }}'
+        alias: Charging Current > 2 and Battery < 100%
       then:
-      - if:
-        - condition: template
-          value_template: '{{ mode == ''eco_charge'' }}'
-          alias: Scheduled outage
-        then:
-        - service: number.set_value
-          data:
-            value: '75'
-          target:
-            entity_id: number.eco_mode_power
-        - service: number.set_value
-          data:
-            value: '100'
-          target:
-            entity_id: number.eco_mode_soc
-        - service: persistent_notification.create
-          data:
-            title: Battery
-            message: Risk of a power outage. Charging the battery to 100%
-        else:
-        - service: persistent_notification.create
-          data:
-            title: Battery
-            message: The power outage situation passed.
-        alias: Set eco_charge parameters
-    mode: single
+      - service: script.ev_set_charger_max_current
+        data:
+          device_id: a3dda8d90539f021815031c3b4912670
+          current:
+            entity_id: sensor.citigo_charger_max_ampere
+          new: '{{ current }}'
+          switch:
+            entity_id: switch.citigo_zasuvka
+      else:
+      - service: switch.turn_off
+        data: {}
+        target:
+          entity_id: switch.citigo_zasuvka
+    alias: Citigo Available and Scheduled (day) - recurrent
+  - if:
+    - condition: state
+      entity_id: input_select.ev_citigo_charging
+      state: Scheduled
+    - condition: state
+      entity_id: sun.sun
+      state: below_horizon
+    - condition: zone
+      entity_id: device_tracker.citigo_position
+      zone: zone.home
+    - condition: state
+      entity_id: binary_sensor.citigo_charging_cable_connected
+      state: 'on'
+    then:
+    - if:
+      - condition: template
+        value_template: '{{ states(''sensor.citigo_battery_level'') | int(0) < states(''input_number.ev_citigo_minimal_charge'')
+          | int(0) }}'
+        alias: Battery below minimal level (helper)
+      then:
+      - service: script.ev_set_charger_max_current
+        data:
+          device_id: a3dda8d90539f021815031c3b4912670
+          current:
+            entity_id: sensor.citigo_charger_max_ampere
+          new: 32
+          switch:
+            entity_id: switch.citigo_zasuvka
+      else:
+      - service: switch.turn_off
+        data: {}
+        target:
+          entity_id: switch.citigo_zasuvka
+    alias: Citigo Scheduled (night) - recurrent
+  - if:
+    - condition: state
+      entity_id: input_select.ev_citigo_charging
+      state: Available
+    - condition: state
+      entity_id: sun.sun
+      state: below_horizon
+    - condition: zone
+      entity_id: device_tracker.citigo_position
+      zone: zone.home
+    - condition: state
+      entity_id: binary_sensor.citigo_charging_cable_connected
+      state: 'on'
+    then:
+    - service: switch.turn_off
+      data: {}
+      target:
+        entity_id: switch.citigo_zasuvka
+    alias: Citigo Available (night) - recurrent
+  mode: queued
+  max: 10
+- id: '1676878681930'
+  alias: "EMS - Handle Power Outage \U0001F50B"
+  description: Turn off the Owen and Swimming pool pump when operating from batery.
+  trigger:
+  - platform: state
+    entity_id:
+    - sensor.grid_mode_code
+    id: power_outage
+    to: '2'
+    from: '1'
+  - platform: state
+    entity_id:
+    - sensor.grid_mode_code
+    id: power_restored
+    to: '1'
+  condition:
+  - condition: state
+    entity_id: input_boolean.energy_management
+    state: 'on'
+  action:
+  - choose:
+    - conditions:
+      - condition: trigger
+        id: power_outage
+      sequence:
+      - service: switch.turn_off
+        data: {}
+        target:
+          entity_id: switch.turn_of_during_power_outage
+      - service: input_select.select_option
+        data:
+          option: 'Off'
+        target:
+          entity_id: input_select.pool_pump
+      - service: persistent_notification.create
+        data:
+          message: Plotna a bazénové čerpadlo vypnuto
+          title: Power outage
+    - conditions:
+      - condition: trigger
+        id: power_restored
+      sequence:
+      - service: switch.turn_on
+        data: {}
+        target:
+          entity_id: switch.turn_of_during_power_outage
+      - service: input_select.select_option
+        data:
+          option: Auto
+        target:
+          entity_id: input_select.pool_pump
+      - service: persistent_notification.create
+        data:
+          title: Power restored
+          message: Bazénové čerpadlo a plotna zapnuty
+  mode: single
+- id: '1677400876279'
+  alias: "EMS - Handle Battery charging mode (EV/meteoalarm) \U0001F697 \U0001F50B"
+  description: 'Prevent charging EV from battery at night or in the FAST mode.
+
+    Decrease maximum battery discharge to 50% when power outage is expected.
+
+    Set back to 90% when back in normal.'
+  trigger:
+  - platform: state
+    entity_id:
+    - binary_sensor.meteoalarm
+    id: scheduled_outage
+  - platform: state
+    entity_id:
+    - input_boolean.scheduled_power_outage
+    id: scheduled_outage
+  - platform: state
+    entity_id:
+    - switch.citigo_charging
+    id: citigo_charging
+  condition:
+  - condition: state
+    entity_id: input_boolean.energy_management
+    state: 'on'
+  action:
+  - variables:
+      mode: "{%- set severe_weather = iif(state_attr('binary_sensor.meteoalarm','awareness_type')
+        != None, state_attr('binary_sensor.meteoalarm','awareness_type').split(';')[0]
+        | int,'') %} {%- set wind_thunderstorm = is_state('binary_sensor.meteoalarm','on')
+        and severe_weather in [1,3] %} {%- set fast = is_state('input_select.ev_citigo_charging','Fast')
+        and (states('sensor.average_pv_power') | float(0.0) < 4) %}  {%- set scheduled
+        = is_state('input_select.ev_citigo_charging','Scheduled') and is_state('sun.sun','below_horizon')
+        %}  {%- if wind_thunderstorm or is_state('input_boolean.scheduled_power_outage','on')
+        %}\n  eco_charge\n{%- elif is_state('switch.citigo_charging','on') and is_state('device_tracker.citigo_position','home')
+        and (fast or scheduled) %}\n  backup\n{%- else %}\n  general\n{%- endif %}"
+  - condition: template
+    value_template: '{{ states(''select.inverter_operation_mode'') != mode }}'
+    alias: Continue only if state changes (e.g. quit on irrelevant weather alert)
+  - service: select.select_option
+    data:
+      option: '{{ mode }}'
+    target:
+      entity_id: select.inverter_operation_mode
+    alias: Set the inverter mode
+  - if:
+    - condition: trigger
+      id: scheduled_outage
+    then:
+    - if:
+      - condition: template
+        value_template: '{{ mode == ''eco_charge'' }}'
+        alias: Scheduled outage
+      then:
+      - service: number.set_value
+        data:
+          value: '75'
+        target:
+          entity_id: number.eco_mode_power
+      - service: number.set_value
+        data:
+          value: '100'
+        target:
+          entity_id: number.eco_mode_soc
+      - service: persistent_notification.create
+        data:
+          title: Battery
+          message: Risk of a power outage. Charging the battery to 100%
+      else:
+      - service: persistent_notification.create
+        data:
+          title: Battery
+          message: The power outage situation passed.
+      alias: Set eco_charge parameters
+  mode: single
+- id: '1679398133653'
+  alias: "EMS - Control battery max charge at least once per week \U0001F50B"
+  description: Make sure the battery is fully charged at least once a week.
+  trigger:
+  - platform: numeric_state
+    entity_id: sensor.battery_state_of_charge
+    above: 99
+    id: fully_charged
+  - platform: sun
+    event: sunset
+    offset: '-4'
+    id: check
+  condition: []
+  action:
+  - choose:
+    - conditions:
+      - condition: trigger
+        id: fully_charged
+      sequence:
+      - service: input_datetime.set_datetime
+        data:
+          date: '{{ now() | as_timestamp | timestamp_custom(''%Y-%m-%d'') }}'
+        target:
+          entity_id: input_datetime.last_time_battery_fully_charged
+      - condition: state
+        entity_id: select.inverter_operation_mode
+        state: eco_charge
+      - service: select.select_option
+        data:
+          option: general
+        target:
+          entity_id: select.inverter_operation_mode
+    - conditions:
+      - condition: trigger
+        id: check
+      sequence:
+      - condition: template
+        value_template: '{{ ((now() | as_timestamp - states(''input_datetime.last_time_battery_fully_charged'')
+          | as_timestamp ) / 86400) > 7 }}'
+        alias: Fully charged more than a week ago
+      - service: number.set_value
+        data:
+          value: '75'
+        target:
+          entity_id: number.eco_mode_power
+      - service: number.set_value
+        data:
+          value: '100'
+        target:
+          entity_id: number.eco_mode_soc
+      - service: select.select_option
+        data:
+          option: eco_charge
+        target:
+          entity_id: select.inverter_operation_mode
+  mode: single
+- id: '1680449752897'
+  alias: "EMS - Set Depth of discharge over night \U0001F50B"
+  description: Set maximum depth of discharge based on the next day forecast
+  trigger:
+  - platform: state
+    entity_id:
+    - sun.sun
+    from: above_horizon
+    to: below_horizon
+    id: sunset
+  - platform: state
+    entity_id:
+    - input_number.ems_discharge_bad_day
+    - input_number.ems_discharge_good_day
+    - input_number.ems_next_day_energy_treshold
+    id: parameter_change
+  condition:
+  - condition: state
+    entity_id: input_boolean.energy_management
+    state: 'on'
+  action:
+  - variables:
+      bad_day: '{{ states(''sensor.energy_production_tomorrow_front'') | int < states(''input_number.ems_next_day_energy_treshold'')
+        | int }}'
+  - service: number.set_value
+    data:
+      value: '{{ iif(bad_day,states(''input_number.ems_discharge_bad_day''),states(''input_number.ems_discharge_good_day''))
+        }}'
+    target:
+      entity_id: number.depth_of_discharge_on_grid
+  mode: queued
+  max: 10
+
   - id: '1679398133653'
     alias: "EMS - Control battery max charge at least once per week \U0001F50B"
     description: Make sure the battery is fully charged at least once a week.
